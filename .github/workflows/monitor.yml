@@ -2,7 +2,7 @@ name: Planet IMAX monitor
 
 on:
   schedule:
-    # GitHub Actions schedules use UTC. Every 5 minutes, 24/7.
+    # Check every 5 minutes, including exact hour boundaries
     - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
