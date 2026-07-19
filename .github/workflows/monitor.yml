@@ -1,0 +1,75 @@
+name: Planet IMAX monitor
+
+on:
+  schedule:
+    # GitHub Actions schedules use UTC. Every 5 minutes, 24/7.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send Telegram sanity-check message"
+        required: false
+        type: boolean
+        default: true
+      notify_on_first_run:
+        description: "Notify after creating the initial baseline"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: planet-imax-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Run monitor
+        run: |
+          ARGS=""
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.send_test }}" == "true" ]]; then
+            ARGS="$ARGS --send-test"
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.notify_on_first_run }}" == "true" ]]; then
+            ARGS="$ARGS --notify-on-first-run"
+          fi
+          python monitor.py $ARGS
+
+      - name: Commit updated monitor state
+        if: ${{ github.event_name == 'schedule' || inputs.send_test == false }}
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "No state change."
+            exit 0
+          fi
+          git config user.name "planet-imax-monitor[bot]"
+          git config user.email "planet-imax-monitor[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: update IMAX monitor state"
+          git push
