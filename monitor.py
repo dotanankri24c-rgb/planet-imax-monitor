@@ -34,7 +34,6 @@ STATE_VERSION = 5
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json"))
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "21"))
 TELEGRAM_MAX_TEXT = 3900
-FORCE_NOTIFY_KEY = "force_notify"
 ISRAEL_TIMEZONE = ZoneInfo("Asia/Jerusalem")
 
 HEBREW_WEEKDAYS = (
@@ -303,39 +302,17 @@ async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
     return sorted(deduplicated.values(), key=showing_sort_key)
 
 
-def empty_current_state(force_notify: bool = False) -> dict[str, Any]:
-    """Return an explicit empty state, optionally requesting one forced alert."""
-    state: dict[str, Any] = {
-        "state_version": STATE_VERSION,
-        "showings": [],
-    }
-    if force_notify:
-        state[FORCE_NOTIFY_KEY] = True
-    return state
+def load_state(path: Path = STATE_PATH) -> dict[str, Any]:
+    """Load and validate the persisted comparison state.
 
-
-def state_requests_force_notification(previous: dict[str, Any] | None) -> bool:
-    """Return whether the persisted state requests a one-shot forced alert."""
-    return bool(
-        state_is_current(previous)
-        and previous.get(FORCE_NOTIFY_KEY) is True
-    )
-
-
-def load_state(path: Path = STATE_PATH) -> dict[str, Any] | None:
-    """
-    Load the persisted monitor state.
-
-    A missing file means this is a genuine first run or schema migration, so the
-    normal baseline protection remains active. For backward compatibility, an
-    existing but blank file becomes an explicit one-shot forced-notification state.
-
-    The preferred reset mechanism is valid JSON containing ``"force_notify": true``.
-    Non-empty malformed JSON is not a reset. Failing loudly prevents accidental
-    state corruption from silently disabling notifications or erasing history.
+    The production monitor must never silently rebuild a missing or corrupted
+    baseline, because doing so could absorb a genuinely new screening without a
+    notification. Restore a valid committed state instead.
     """
     if not path.exists():
-        return None
+        raise RuntimeError(
+            f"State file {path} is missing. Restore the committed state before running."
+        )
 
     try:
         raw_state = path.read_text(encoding="utf-8")
@@ -343,27 +320,36 @@ def load_state(path: Path = STATE_PATH) -> dict[str, Any] | None:
         raise RuntimeError(f"Could not read state file {path}: {exc}") from exc
 
     if not raw_state.strip():
-        print(
-            f"Blank state file detected at {path}; "
-            "converting it to a one-shot forced notification request."
+        raise RuntimeError(
+            f"State file {path} is blank. Restore the committed JSON state; "
+            "do not empty it to test notifications."
         )
-        return empty_current_state(force_notify=True)
 
     try:
         value = json.loads(raw_state)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"State file {path} contains invalid JSON. "
-            f"Use valid JSON with {FORCE_NOTIFY_KEY}=true to request an alert reset."
+            f"State file {path} contains invalid JSON. Restore the committed state."
         ) from exc
 
     if not isinstance(value, dict):
+        raise RuntimeError(f"State file {path} must contain a JSON object.")
+
+    if value.get("state_version") != STATE_VERSION:
         raise RuntimeError(
-            f"State file {path} must contain a JSON object."
+            f"State file {path} has version {value.get('state_version')!r}; "
+            f"expected {STATE_VERSION}. Update the state together with the code."
+        )
+
+    showings = value.get("showings")
+    if not isinstance(showings, list) or any(
+        not isinstance(item, dict) for item in showings
+    ):
+        raise RuntimeError(
+            f"State file {path} must contain a 'showings' list of JSON objects."
         )
 
     return value
-
 
 def state_is_current(previous: dict[str, Any] | None) -> bool:
     return bool(previous and previous.get("state_version") == STATE_VERSION)
@@ -541,46 +527,7 @@ def alert_messages(items: list[dict[str, str]]) -> list[str]:
     )
 
 
-def forced_notification_messages(items: list[dict[str, str]]) -> list[str]:
-    """Build a guaranteed diagnostic notification for an explicit force request."""
-    if not items:
-        return [
-            "🔔 בדיקת התראה מאולצת בוצעה בהצלחה.\n"
-            "החיבור ל-Telegram עובד, אך כרגע לא זוהו הקרנות IMAX תקפות."
-        ]
-
-    header = (
-        "🔔 בדיקת התראה מאולצת.\n"
-        f"זוהו כרגע {len(items)} הקרנות IMAX:"
-    )
-    return split_telegram_message(
-        header,
-        [format_showing(item) for item in items],
-    )
-
-
-def baseline_messages(showings: list[dict[str, str]]) -> list[str]:
-    if not showings:
-        return [
-            "✅ הניטור הופעל ונוצר baseline חדש.\n"
-            "כרגע לא זוהו הקרנות IMAX של האודיסאה."
-        ]
-
-    header = (
-        "✅ הניטור הופעל ונוצר baseline חדש.\n"
-        f"נשמרו {len(showings)} הקרנות IMAX בלבד:"
-    )
-    return split_telegram_message(
-        header,
-        [format_showing(item) for item in showings],
-    )
-
-
-async def run(
-    send_test: bool,
-    notify_on_first_run: bool,
-    force_notify: bool = False,
-) -> int:
+async def run(send_test: bool) -> int:
     if send_test:
         telegram_send_one(
             "✅ בדיקת שפיות הצליחה: "
@@ -591,11 +538,13 @@ async def run(
 
     current = await scrape_showings()
     previous = load_state()
-    force_requested = force_notify or state_requests_force_notification(previous)
-    baseline_run = not state_is_current(previous)
+    previous_showings = [
+        item for item in previous.get("showings", []) if isinstance(item, dict)
+    ]
     new_items = find_new_showings(previous, current)
     known_showings = merge_known_showings(previous, current)
 
+    print(f"Previously known screenings: {len(previous_showings)}")
     print(f"Total validated IMAX screenings found this run: {len(current)}")
     for item in current:
         print(
@@ -606,23 +555,16 @@ async def run(
         )
 
     print(f"New validated IMAX screenings found: {len(new_items)}")
+    for item in new_items:
+        print(
+            f"  NEW date={item.get('date') or '?'} "
+            f"weekday={item.get('weekday') or '?'} "
+            f"time={item.get('time')}"
+        )
     print(f"Known not-yet-past screenings saved: {len(known_showings)}")
-    print(f"Baseline/migration run: {baseline_run}")
-    print(f"Forced notification requested: {force_requested}")
 
-    messages: list[str] = []
-    notification_mode = "none"
-
-    if force_requested:
-        messages = forced_notification_messages(current)
-        notification_mode = "forced-current-snapshot"
-    elif baseline_run and notify_on_first_run:
-        messages = baseline_messages(known_showings)
-        notification_mode = "first-run-baseline"
-    elif new_items:
-        messages = alert_messages(new_items)
-        notification_mode = "new-screenings"
-
+    messages = alert_messages(new_items)
+    notification_mode = "new-screenings" if messages else "none"
     print(
         f"Notification decision: mode={notification_mode}, "
         f"message_count={len(messages)}"
@@ -634,27 +576,18 @@ async def run(
     else:
         print("No Telegram notification required for this run.")
 
-    # Persist only after notification handling. The one-shot force flag is never
-    # written back, so a successful run consumes it automatically.
+    # Persist only after successful notification handling. If Telegram fails, the
+    # state is not advanced, so the same new screening will be retried next run.
     save_state(known_showings)
     return 0
-
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--send-test", action="store_true")
-    parser.add_argument("--notify-on-first-run", action="store_true")
-    parser.add_argument("--force-notify", action="store_true")
     args = parser.parse_args()
 
     try:
-        return asyncio.run(
-            run(
-                args.send_test,
-                args.notify_on_first_run,
-                args.force_notify,
-            )
-        )
+        return asyncio.run(run(args.send_test))
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

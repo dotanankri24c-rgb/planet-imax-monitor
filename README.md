@@ -1,83 +1,63 @@
 # Planet IMAX Telegram Monitor
 
-Monitors Planet Rishon LeZion for validated IMAX screenings of **The Odyssey / האודיסאה** and sends Telegram notifications when genuinely new screenings appear.
+Monitors Planet Rishon LeZion for validated IMAX screenings of **The Odyssey / האודיסאה** and sends Telegram notifications only when a screening appears that is not already recorded in `state.json`.
 
-## Telegram setup
+## Production behavior
 
-Store these repository secrets under **Settings → Secrets and variables → Actions**:
+Every normal run follows exactly one path:
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+1. scrape the current validated IMAX screenings;
+2. load the previously committed state;
+3. calculate `new screenings = current screenings - previous screenings`;
+4. send a normal Telegram alert for those new screenings only;
+5. save the merged state only after Telegram accepts the notification.
 
-The token and chat ID must never be committed to the repository.
+There is no forced-notification mode and no notification mode stored inside `state.json`.
 
-## Notification modes
+## State safety
 
-The monitor has three separate notification paths:
+`state.json` is the comparison baseline and should not be emptied to test Telegram.
 
-1. **Sanity check** — verifies only that Telegram is reachable.
-2. **New screenings** — sends screenings not already recorded in the state.
-3. **Forced current snapshot** — always sends a diagnostic message containing the screenings detected in the current run. If no screenings are detected, it still sends a Telegram message saying so.
+The monitor now fails loudly when the state is:
 
-### Reliable one-shot forced notification
+- missing;
+- blank;
+- malformed JSON;
+- using the wrong state version;
+- missing a valid `showings` list.
 
-Use valid JSON in `state.json`:
+This prevents a damaged state from silently absorbing a genuinely new screening.
 
-```json
-{
-  "state_version": 5,
-  "force_notify": true,
-  "showings": []
-}
-```
+Planet occasionally omits an existing date during one scrape. Known future screenings are therefore retained until their date passes, preventing a disappearance/reappearance from producing duplicate alerts.
 
-Commit and push it together with the current `monitor.py`. The next run will:
+## Telegram sanity check
 
-1. print `Forced notification requested: True`;
-2. print `Notification decision: mode=forced-current-snapshot`;
-3. send at least one Telegram message, even if the scraper found zero screenings;
-4. print the Telegram `message_id` returned by the API;
-5. save a normal state without `force_notify`, consuming the request once.
+The manual **Send Telegram sanity-check message only** option verifies the bot token and chat ID. It does not scrape Planet, compare screenings, or change `state.json`.
 
-A blank state file is still recognized for backward compatibility, but the explicit JSON flag is the preferred mechanism.
+It is only a connectivity test. Normal screening notifications always use the automatic comparison path.
 
-### Force from the Actions interface
+## Diagnostic logs
 
-Open **Actions → Planet IMAX monitor → Run workflow** and set:
-
-- **Send Telegram sanity-check message only:** false
-- **Send a current-screenings notification even if nothing is new:** true
-
-This uses the `--force-notify` command-line option and does not require editing `state.json`.
-
-## State behavior
-
-- Every showing includes its Hebrew weekday in `state.json` and Telegram.
-- Known future screenings are retained when Planet temporarily fails to render a date.
-- Past dates are pruned automatically.
-- The optional `force_notify` field is never written back by `save_state`, so it is one-shot.
-- Missing state uses first-run baseline protection.
-- Malformed non-empty JSON fails loudly.
-
-## Expected diagnostic log
-
-A forced run should include lines similar to:
+For a real new screening, the workflow should print lines similar to:
 
 ```text
-Forced notification requested: True
-Notification decision: mode=forced-current-snapshot, message_count=1
+Previously known screenings: 12
+Total validated IMAX screenings found this run: 13
+New validated IMAX screenings found: 1
+  NEW date=2026-07-23 weekday=יום חמישי time=20:30
+Notification decision: mode=new-screenings, message_count=1
 Telegram accepted message successfully; message_id=123
 Telegram delivery completed for 1 message(s).
 ```
 
-If the first two lines appear but the Telegram acceptance line does not, the workflow failed during the Telegram request. If the acceptance line appears, Telegram returned `ok: true` and supplied a concrete message ID.
+If Telegram fails, the state is not saved. The screening therefore remains new and will be retried in the next run.
 
-## Manual checks
+## Local tests
 
 ```bash
 pip install -r requirements.txt
 playwright install chromium
 pytest -q
-python monitor.py --send-test
-python monitor.py --force-notify
 ```
+
+The test suite includes an end-to-end regression test that starts with one known screening, returns one additional screening from the scraper, and verifies that the monitor sends the normal Hebrew “new IMAX screenings” alert containing only the new screening.

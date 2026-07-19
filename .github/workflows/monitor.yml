@@ -14,16 +14,6 @@ on:
         required: false
         type: boolean
         default: true
-      notify_on_first_run:
-        description: "Notify after creating the initial baseline"
-        required: false
-        type: boolean
-        default: false
-      force_notify:
-        description: "Send a current-screenings notification even if nothing is new"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -64,14 +54,6 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.send_test }}" == "true" ]]; then
             ARGS+=(--send-test)
-          fi
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.notify_on_first_run }}" == "true" ]]; then
-            ARGS+=(--notify-on-first-run)
-          fi
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force_notify }}" == "true" ]]; then
-            ARGS+=(--force-notify)
           fi
 
           printf 'Monitor arguments:'

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import date
 
 import monitor
@@ -9,12 +10,10 @@ from monitor import (
     extract_date,
     extract_imax_showings,
     find_new_showings,
-    forced_notification_messages,
     load_state,
     merge_known_showings,
     save_state,
     split_telegram_message,
-    state_requests_force_notification,
     weekday_name,
 )
 
@@ -35,6 +34,13 @@ def showing(screening_date: str, screening_time: str = "20:30") -> dict[str, str
         "time": screening_time,
         "format": "IMAX",
         "url": URL_19.replace("2026-07-19", screening_date),
+    }
+
+
+def valid_state(*items: dict[str, str]) -> dict:
+    return {
+        "state_version": STATE_VERSION,
+        "showings": list(items),
     }
 
 
@@ -62,264 +68,187 @@ def test_extracted_showings_include_weekday():
         URL_19,
         "2026-07-19",
     )
-
     assert [item["time"] for item in items] == ["10:00", "13:30"]
     assert all(item["weekday"] == "יום ראשון" for item in items)
 
 
-def test_state_version_migration_avoids_false_alert():
-    previous = {
-        "state_version": STATE_VERSION - 1,
-        "showings": [],
-    }
-    current = [showing("2026-07-19")]
-    assert find_new_showings(previous, current) == []
-
-
-def test_missing_state_file_keeps_first_run_alert_protection(tmp_path):
-    previous = load_state(tmp_path / "missing-state.json")
-    current = [showing("2026-07-19")]
-
-    assert previous is None
-    assert find_new_showings(previous, current) == []
-
-
-def test_blank_state_file_is_an_explicit_alert_reset(tmp_path):
-    state_path = tmp_path / "state.json"
-    state_path.write_text("", encoding="utf-8")
-
-    previous = load_state(state_path)
-    current = [showing("2026-07-19")]
-    new_items = find_new_showings(previous, current)
-
-    assert previous == {
-        "state_version": STATE_VERSION,
-        "showings": [],
-        "force_notify": True,
-    }
-    assert state_requests_force_notification(previous)
-    assert len(new_items) == 1
-    assert new_items[0]["date"] == "2026-07-19"
-    assert new_items[0]["weekday"] == "יום ראשון"
-
-
-def test_whitespace_only_state_file_is_an_explicit_alert_reset(tmp_path):
-    state_path = tmp_path / "state.json"
-    state_path.write_text("  \n\t", encoding="utf-8")
-
-    previous = load_state(state_path)
-
-    assert previous == {
-        "state_version": STATE_VERSION,
-        "showings": [],
-        "force_notify": True,
-    }
-    assert state_requests_force_notification(previous)
-
-
-def test_malformed_nonempty_state_fails_loudly(tmp_path):
-    state_path = tmp_path / "state.json"
-    state_path.write_text("{not valid json}", encoding="utf-8")
-
+def test_missing_state_fails_loudly(tmp_path):
     try:
-        load_state(state_path)
+        load_state(tmp_path / "missing.json")
+    except RuntimeError as exc:
+        assert "missing" in str(exc)
+    else:
+        raise AssertionError("Missing state must fail instead of creating a silent baseline")
+
+
+def test_blank_state_fails_loudly(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("", encoding="utf-8")
+    try:
+        load_state(path)
+    except RuntimeError as exc:
+        assert "blank" in str(exc)
+        assert "do not empty" in str(exc)
+    else:
+        raise AssertionError("Blank state must not reset the comparison baseline")
+
+
+def test_malformed_state_fails_loudly(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("{not json}", encoding="utf-8")
+    try:
+        load_state(path)
     except RuntimeError as exc:
         assert "invalid JSON" in str(exc)
-        assert "force_notify" in str(exc)
     else:
-        raise AssertionError("Malformed non-empty state must raise RuntimeError")
+        raise AssertionError("Malformed state must fail")
 
 
-def test_blank_state_reaches_telegram_alert_path(tmp_path, monkeypatch):
-    state_path = tmp_path / "state.json"
-    state_path.write_text("", encoding="utf-8")
-    current = [showing("2026-07-19")]
-    sent_messages: list[str] = []
-    saved_showings: list[dict[str, str]] = []
-
-    async def fake_scrape_showings():
-        return current
-
-    monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
-    monkeypatch.setattr(monitor, "load_state", lambda: load_state(state_path))
-    monkeypatch.setattr(
-        monitor,
-        "save_state",
-        lambda showings: saved_showings.extend(showings),
-    )
-    monkeypatch.setattr(
-        monitor,
-        "telegram_send_many",
-        lambda messages: sent_messages.extend(messages),
-    )
-
-    result = asyncio.run(
-        monitor.run(send_test=False, notify_on_first_run=False)
-    )
-
-    assert result == 0
-    assert len(saved_showings) == 1
-    assert len(sent_messages) == 1
-    assert "בדיקת התראה מאולצת" in sent_messages[0]
-    assert "יום ראשון, 19/07/2026" in sent_messages[0]
-
-
-def test_explicit_json_force_notify_state_is_detected(tmp_path):
-    state_path = tmp_path / "state.json"
-    state_path.write_text(
-        '{"state_version": %d, "showings": [], "force_notify": true}'
-        % STATE_VERSION,
+def test_wrong_state_version_fails_loudly(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps({"state_version": STATE_VERSION - 1, "showings": []}),
         encoding="utf-8",
     )
+    try:
+        load_state(path)
+    except RuntimeError as exc:
+        assert "expected" in str(exc)
+    else:
+        raise AssertionError("Version mismatch must fail")
 
-    previous = load_state(state_path)
 
-    assert state_requests_force_notification(previous)
+def test_invalid_showings_shape_fails_loudly(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps({"state_version": STATE_VERSION, "showings": {}}),
+        encoding="utf-8",
+    )
+    try:
+        load_state(path)
+    except RuntimeError as exc:
+        assert "showings" in str(exc)
+    else:
+        raise AssertionError("Invalid showings shape must fail")
 
 
-def test_force_notify_sends_snapshot_even_when_showing_is_already_known(monkeypatch):
-    current = [showing("2026-07-19")]
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": current,
-        "force_notify": True,
-    }
+def test_valid_empty_state_naturally_detects_all_current_showings():
+    current = [showing("2026-07-19"), showing("2026-07-20", "10:00")]
+    new_items = find_new_showings(valid_state(), current)
+    assert len(new_items) == 2
+
+
+def test_current_state_detects_only_missing_showing():
+    known = showing("2026-07-19")
+    new = showing("2026-07-20", "10:00")
+    new_items = find_new_showings(valid_state(known), [known, new])
+    assert len(new_items) == 1
+    assert new_items[0]["date"] == "2026-07-20"
+    assert new_items[0]["weekday"] == "יום שני"
+
+
+def test_run_sends_normal_alert_for_genuinely_new_showing(monkeypatch):
+    known = showing("2026-07-19")
+    new = showing("2026-07-20", "10:00")
+    previous = valid_state(known)
     sent_messages: list[str] = []
     saved_showings: list[dict[str, str]] = []
 
     async def fake_scrape_showings():
-        return current
+        return [known, new]
 
     monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
     monkeypatch.setattr(monitor, "load_state", lambda: previous)
+    monkeypatch.setattr(
+        monitor,
+        "telegram_send_many",
+        lambda messages: sent_messages.extend(messages),
+    )
     monkeypatch.setattr(
         monitor,
         "save_state",
         lambda showings: saved_showings.extend(showings),
     )
-    monkeypatch.setattr(
-        monitor,
-        "telegram_send_many",
-        lambda messages: sent_messages.extend(messages),
-    )
 
-    result = asyncio.run(
-        monitor.run(
-            send_test=False,
-            notify_on_first_run=False,
-            force_notify=False,
-        )
-    )
+    result = asyncio.run(monitor.run(send_test=False))
 
     assert result == 0
     assert len(sent_messages) == 1
-    assert "בדיקת התראה מאולצת" in sent_messages[0]
-    assert "יום ראשון, 19/07/2026" in sent_messages[0]
-    assert len(saved_showings) == 1
+    assert "נמצאו הקרנות IMAX חדשות" in sent_messages[0]
+    assert "יום שני, 20/07/2026" in sent_messages[0]
+    assert "יום ראשון, 19/07/2026" not in sent_messages[0]
+    assert len(saved_showings) == 2
 
 
-def test_force_notify_sends_diagnostic_even_when_scrape_is_empty(monkeypatch):
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": [],
-        "force_notify": True,
-    }
+def test_run_does_not_notify_when_nothing_is_new(monkeypatch):
+    known = showing("2026-07-19")
+    previous = valid_state(known)
     sent_messages: list[str] = []
 
     async def fake_scrape_showings():
-        return []
+        return [known]
 
     monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
     monkeypatch.setattr(monitor, "load_state", lambda: previous)
-    monkeypatch.setattr(monitor, "save_state", lambda showings: None)
     monkeypatch.setattr(
         monitor,
         "telegram_send_many",
         lambda messages: sent_messages.extend(messages),
     )
+    monkeypatch.setattr(monitor, "save_state", lambda showings: None)
 
-    result = asyncio.run(
-        monitor.run(
-            send_test=False,
-            notify_on_first_run=False,
-            force_notify=False,
-        )
-    )
-
-    assert result == 0
-    assert sent_messages == forced_notification_messages([])
-    assert "לא זוהו הקרנות" in sent_messages[0]
+    assert asyncio.run(monitor.run(send_test=False)) == 0
+    assert sent_messages == []
 
 
-def test_cli_force_notify_overrides_normal_state(monkeypatch):
-    current = [showing("2026-07-19")]
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": current,
-    }
-    sent_messages: list[str] = []
+def test_state_is_not_advanced_when_telegram_fails(monkeypatch):
+    known = showing("2026-07-19")
+    new = showing("2026-07-20", "10:00")
+    previous = valid_state(known)
+    save_called = False
 
     async def fake_scrape_showings():
-        return current
+        return [known, new]
+
+    def fail_send(messages):
+        raise RuntimeError("Telegram unavailable")
+
+    def record_save(showings):
+        nonlocal save_called
+        save_called = True
 
     monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
     monkeypatch.setattr(monitor, "load_state", lambda: previous)
-    monkeypatch.setattr(monitor, "save_state", lambda showings: None)
-    monkeypatch.setattr(
-        monitor,
-        "telegram_send_many",
-        lambda messages: sent_messages.extend(messages),
-    )
+    monkeypatch.setattr(monitor, "telegram_send_many", fail_send)
+    monkeypatch.setattr(monitor, "save_state", record_save)
 
-    result = asyncio.run(
-        monitor.run(
-            send_test=False,
-            notify_on_first_run=False,
-            force_notify=True,
-        )
-    )
+    try:
+        asyncio.run(monitor.run(send_test=False))
+    except RuntimeError as exc:
+        assert "Telegram unavailable" in str(exc)
+    else:
+        raise AssertionError("Telegram failure must propagate")
 
-    assert result == 0
-    assert len(sent_messages) == 1
-    assert "בדיקת התראה מאולצת" in sent_messages[0]
+    assert not save_called
 
 
-def test_save_state_consumes_force_notify_flag(tmp_path):
-    state_path = tmp_path / "state.json"
-    save_state([showing("2026-07-19")], state_path)
+def test_send_test_does_not_scrape_or_modify_state(monkeypatch):
+    sent: list[str] = []
 
-    saved = load_state(state_path)
+    async def forbidden_scrape():
+        raise AssertionError("sanity check must not scrape")
 
-    assert saved is not None
-    assert "force_notify" not in saved
-    assert len(saved["showings"]) == 1
+    monkeypatch.setattr(monitor, "scrape_showings", forbidden_scrape)
+    monkeypatch.setattr(monitor, "telegram_send_one", sent.append)
 
-
-def test_current_state_detects_new_showing():
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": [],
-    }
-    current = [showing("2026-07-19")]
-
-    new_items = find_new_showings(previous, current)
-
-    assert len(new_items) == 1
-    assert new_items[0]["weekday"] == "יום ראשון"
+    assert asyncio.run(monitor.run(send_test=True)) == 0
+    assert len(sent) == 1
+    assert "בדיקת שפיות" in sent[0]
 
 
 def test_missing_future_showing_is_retained_in_state():
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": [showing("2026-07-22", "10:00")],
-    }
-
-    merged = merge_known_showings(
-        previous,
-        current=[],
-        today=date(2026, 7, 19),
-    )
-
+    previous = valid_state(showing("2026-07-22", "10:00"))
+    merged = merge_known_showings(previous, current=[], today=date(2026, 7, 19))
     assert len(merged) == 1
     assert merged[0]["date"] == "2026-07-22"
     assert merged[0]["weekday"] == "יום רביעי"
@@ -327,40 +256,24 @@ def test_missing_future_showing_is_retained_in_state():
 
 def test_reappearing_showing_is_not_reported_again():
     original = showing("2026-07-22", "10:00")
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": [original],
-    }
-
-    state_after_incomplete_scrape = merge_known_showings(
-        previous,
-        current=[],
-        today=date(2026, 7, 19),
-    )
-    next_previous = {
-        "state_version": STATE_VERSION,
-        "showings": state_after_incomplete_scrape,
-    }
-
-    assert find_new_showings(next_previous, [original]) == []
+    previous = valid_state(original)
+    retained = merge_known_showings(previous, current=[], today=date(2026, 7, 19))
+    assert find_new_showings(valid_state(*retained), [original]) == []
 
 
 def test_past_showings_are_pruned_from_known_state():
-    previous = {
-        "state_version": STATE_VERSION,
-        "showings": [
-            showing("2026-07-18"),
-            showing("2026-07-19"),
-        ],
-    }
-
-    merged = merge_known_showings(
-        previous,
-        current=[],
-        today=date(2026, 7, 19),
-    )
-
+    previous = valid_state(showing("2026-07-18"), showing("2026-07-19"))
+    merged = merge_known_showings(previous, current=[], today=date(2026, 7, 19))
     assert [item["date"] for item in merged] == ["2026-07-19"]
+
+
+def test_save_state_adds_weekday_and_preserves_valid_structure(tmp_path):
+    path = tmp_path / "state.json"
+    save_state([showing("2026-07-20")], path)
+    saved = load_state(path)
+    assert saved["state_version"] == STATE_VERSION
+    assert saved["showings"][0]["weekday"] == "יום שני"
+    assert set(saved) == {"state_version", "showings"}
 
 
 def test_empty_alert_does_not_create_header_only_message():
@@ -381,10 +294,7 @@ def test_long_telegram_content_is_split():
 
 
 def test_alert_messages_are_below_telegram_limit():
-    items = [
-        showing(f"2026-07-{day:02d}")
-        for day in range(1, 32)
-    ]
+    items = [showing(f"2026-07-{day:02d}") for day in range(1, 32)]
     messages = alert_messages(items)
     assert len(messages) > 1
     assert all(len(message) <= 3900 for message in messages)
