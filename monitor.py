@@ -15,10 +15,6 @@ import requests
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-CINEMA_URL = os.getenv(
-    "PLANET_CINEMA_URL",
-    "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon/1072",
-)
 MOVIE_PAGE_URL = os.getenv(
     "PLANET_MOVIE_URL",
     "https://www.planetcinema.co.il/films/the-odyssey/7460s2r",
@@ -33,10 +29,10 @@ MOVIE_TERMS = [
 MOVIE_NAME = os.getenv("MOVIE_NAME", "האודיסאה")
 CINEMA_NAME = "Planet Rishon LeZion"
 FORMAT_NAME = "IMAX"
-STATE_VERSION = 3
+STATE_VERSION = 4
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json"))
-BASE_URL = "https://www.planetcinema.co.il"
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "21"))
+TELEGRAM_MAX_TEXT = 3900
 
 TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 NEXT_FORMAT_RE = re.compile(
@@ -70,19 +66,15 @@ def is_relevant(text: str) -> bool:
 
 
 def extract_date(url: str) -> str:
-    """
-    Planet stores booking parameters inside the URL fragment, for example:
-    ...#/buy-tickets-by-film?in-cinema=1072&at=2026-07-19
-    """
     parsed = urlparse(url)
 
-    query_values = parse_qs(parsed.query).get("at", [])
-    if query_values:
-        return query_values[0]
+    direct = parse_qs(parsed.query).get("at", [])
+    if direct:
+        return direct[0]
 
     fragment_query = parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else ""
-    fragment_values = parse_qs(fragment_query).get("at", [])
-    return fragment_values[0] if fragment_values else ""
+    fragment = parse_qs(fragment_query).get("at", [])
+    return fragment[0] if fragment else ""
 
 
 def build_booking_url(day: date) -> str:
@@ -100,7 +92,7 @@ def build_booking_url(day: date) -> str:
 def extract_imax_showings(
     context: str,
     booking_url: str,
-    expected_date: str = "",
+    screening_date: str,
 ) -> list[dict[str, str]]:
     compact = normalize(context)
     match = re.search(r"IMAX\s*(?:2D|3D)?\s*(.*)", compact, flags=re.IGNORECASE)
@@ -109,7 +101,6 @@ def extract_imax_showings(
 
     imax_section = NEXT_FORMAT_RE.split(match.group(1), maxsplit=1)[0]
     times = list(dict.fromkeys(TIME_RE.findall(imax_section)))
-    screening_date = expected_date or extract_date(booking_url)
 
     return [
         {
@@ -124,11 +115,12 @@ def extract_imax_showings(
     ]
 
 
-async def extract_movie_card(page) -> str:
+async def extract_movie_card(page) -> dict[str, Any]:
     return await page.evaluate(
         """(movieTerms) => {
           const terms = movieTerms.map(value => value.toLocaleLowerCase());
-          let best = '';
+          let bestNode = null;
+          let bestText = '';
 
           for (const element of document.querySelectorAll('body *')) {
             const text = (element.innerText || '').replace(/\\s+/g, ' ').trim();
@@ -137,15 +129,40 @@ async def extract_movie_card(page) -> str:
             const lower = text.toLocaleLowerCase();
             if (!terms.some(term => lower.includes(term))) continue;
 
-            if (!best || text.length < best.length) {
-              best = text;
+            if (!bestText || text.length < bestText.length) {
+              bestNode = element;
+              bestText = text;
             }
           }
 
-          return best;
+          if (!bestNode) return {text: '', links: []};
+
+          const links = [...bestNode.querySelectorAll('a[href]')]
+            .map(anchor => anchor.href || '')
+            .filter(Boolean);
+
+          return {text: bestText, links};
         }""",
         MOVIE_TERMS,
     )
+
+
+def card_has_requested_date(card_links: list[str], requested_date: str) -> bool:
+    """
+    Reject stale/default content.
+
+    Planet may keep showing the currently available day even when the URL hash
+    requests another date. We accept a day only when at least one booking link
+    inside the actual movie card contains that exact date.
+    """
+    return any(extract_date(link) == requested_date for link in card_links)
+
+
+def choose_booking_link(card_links: list[str], requested_date: str, fallback: str) -> str:
+    for link in card_links:
+        if extract_date(link) == requested_date:
+            return link
+    return fallback
 
 
 async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
@@ -158,7 +175,7 @@ async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
             timezone_id="Asia/Jerusalem",
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "Chrome/126 Safari/537.36 PlanetShowtimeMonitor/3.0"
+                "Chrome/126 Safari/537.36 PlanetShowtimeMonitor/4.0"
             ),
         )
 
@@ -166,12 +183,12 @@ async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
             for offset in range(days_ahead + 1):
                 day = date.today() + timedelta(days=offset)
                 day_text = day.isoformat()
-                booking_url = build_booking_url(day)
+                requested_url = build_booking_url(day)
 
-                print(f"Scanning {day_text}: {booking_url}")
+                print(f"Scanning {day_text}: {requested_url}")
 
                 await page.goto(
-                    booking_url,
+                    requested_url,
                     wait_until="domcontentloaded",
                     timeout=60_000,
                 )
@@ -183,16 +200,43 @@ async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
 
                 await page.wait_for_timeout(2_500)
 
-                card_text = normalize(await extract_movie_card(page))
+                card = await extract_movie_card(page)
+                card_text = normalize(card.get("text", ""))
+                card_links = [
+                    str(link)
+                    for link in card.get("links", [])
+                    if isinstance(link, str)
+                ]
+
                 if not card_text or not is_relevant(card_text):
-                    print(f"  No IMAX card found for {day_text}")
+                    print(f"  No Odyssey IMAX card found for {day_text}")
                     continue
 
+                if not card_has_requested_date(card_links, day_text):
+                    actual_dates = sorted(
+                        {
+                            extract_date(link)
+                            for link in card_links
+                            if extract_date(link)
+                        }
+                    )
+                    print(
+                        f"  Skipping stale/unavailable day {day_text}; "
+                        f"card links refer to: {actual_dates or ['unknown']}"
+                    )
+                    continue
+
+                booking_url = choose_booking_link(
+                    card_links,
+                    day_text,
+                    requested_url,
+                )
                 day_showings = extract_imax_showings(
                     card_text,
                     booking_url,
-                    expected_date=day_text,
+                    day_text,
                 )
+
                 print(
                     f"  Found {len(day_showings)} IMAX screening(s): "
                     + ", ".join(item["time"] for item in day_showings)
@@ -264,7 +308,7 @@ def find_new_showings(
     ]
 
 
-def telegram_send(message: str) -> None:
+def telegram_send_one(message: str) -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -282,11 +326,43 @@ def telegram_send(message: str) -> None:
         },
         timeout=20,
     )
-    response.raise_for_status()
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Telegram error {response.status_code}: {response.text}"
+        )
 
     body = response.json()
     if not body.get("ok"):
         raise RuntimeError(f"Telegram returned an error: {body}")
+
+
+def split_telegram_message(header: str, blocks: list[str]) -> list[str]:
+    messages: list[str] = []
+    current = header
+
+    for block in blocks:
+        candidate = f"{current}\n\n{block}"
+        if len(candidate) <= TELEGRAM_MAX_TEXT:
+            current = candidate
+            continue
+
+        if current != header:
+            messages.append(current)
+
+        current = f"{header}\n\n{block}"
+        if len(current) > TELEGRAM_MAX_TEXT:
+            current = current[: TELEGRAM_MAX_TEXT - 3] + "..."
+
+    if current:
+        messages.append(current)
+
+    return messages
+
+
+def telegram_send_many(messages: list[str]) -> None:
+    for message in messages:
+        telegram_send_one(message)
 
 
 def readable_date(value: str) -> str:
@@ -305,29 +381,35 @@ def format_showing(item: dict[str, str]) -> str:
         f"📅 {readable_date(item.get('date', ''))}\n"
         f"🕒 {item.get('time', 'שעה לא זוהתה')}\n"
         f"🎞 {item.get('format', FORMAT_NAME)}\n"
-        f"🔗 {item.get('url', CINEMA_URL)}"
+        f"🔗 {item.get('url', MOVIE_PAGE_URL)}"
     )
 
 
-def format_alert(items: list[dict[str, str]]) -> str:
-    return (
+def alert_messages(items: list[dict[str, str]]) -> list[str]:
+    header = (
         "🎬 נמצאו הקרנות IMAX חדשות של האודיסאה "
-        "בפלאנט ראשון לציון:\n\n"
-        + "\n\n".join(format_showing(item) for item in items)
+        "בפלאנט ראשון לציון:"
+    )
+    return split_telegram_message(
+        header,
+        [format_showing(item) for item in items],
     )
 
 
-def format_baseline(showings: list[dict[str, str]]) -> str:
+def baseline_messages(showings: list[dict[str, str]]) -> list[str]:
     if not showings:
-        return (
+        return [
             "✅ הניטור הופעל ונוצר baseline חדש.\n"
             "כרגע לא זוהו הקרנות IMAX של האודיסאה."
-        )
+        ]
 
-    return (
+    header = (
         "✅ הניטור הופעל ונוצר baseline חדש.\n"
-        f"נשמרו {len(showings)} הקרנות IMAX בלבד:\n\n"
-        + "\n\n".join(format_showing(item) for item in showings)
+        f"נשמרו {len(showings)} הקרנות IMAX בלבד:"
+    )
+    return split_telegram_message(
+        header,
+        [format_showing(item) for item in showings],
     )
 
 
@@ -336,7 +418,7 @@ async def run(
     notify_on_first_run: bool,
 ) -> int:
     if send_test:
-        telegram_send(
+        telegram_send_one(
             "✅ בדיקת שפיות הצליחה: "
             "בוט ניטור האודיסאה מחובר ל-Telegram."
         )
@@ -348,7 +430,7 @@ async def run(
     baseline_run = not state_is_current(previous)
     new_items = find_new_showings(previous, current)
 
-    print(f"Total IMAX screenings found: {len(current)}")
+    print(f"Total validated IMAX screenings found: {len(current)}")
     for item in current:
         print(
             f"- date={item.get('date') or '?'} "
@@ -356,31 +438,23 @@ async def run(
             f"format={item.get('format')}"
         )
 
-    print(f"New IMAX screenings found: {len(new_items)}")
+    print(f"New validated IMAX screenings found: {len(new_items)}")
     print(f"Baseline/migration run: {baseline_run}")
 
     save_state(current)
 
     if baseline_run and notify_on_first_run:
-        telegram_send(format_baseline(current))
+        telegram_send_many(baseline_messages(current))
     elif new_items:
-        telegram_send(format_alert(new_items))
+        telegram_send_many(alert_messages(new_items))
 
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--send-test",
-        action="store_true",
-        help="Send an immediate Telegram sanity-check message.",
-    )
-    parser.add_argument(
-        "--notify-on-first-run",
-        action="store_true",
-        help="Notify after creating the initial baseline.",
-    )
+    parser.add_argument("--send-test", action="store_true")
+    parser.add_argument("--notify-on-first-run", action="store_true")
     args = parser.parse_args()
 
     try:
