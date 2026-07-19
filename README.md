@@ -1,8 +1,8 @@
 # Planet IMAX Telegram Monitor
 
 Monitors the public Planet Rishon LeZion cinema page for links whose surrounding
-text contains both **The Odyssey / האודיסאה** and **IMAX**. When a new matching
-item appears, the workflow sends a Telegram notification.
+text contains both **The Odyssey / האודיסאה** and **IMAX**. When a genuinely new
+matching screening appears, the workflow sends a Telegram notification.
 
 ## Cost
 
@@ -29,13 +29,23 @@ Never place the Telegram token in the repository; keep it in GitHub Actions secr
 10. Run it again with `send_test=false` and `notify_on_first_run=true`.
     This creates the initial baseline and sends a second confirmation.
 
+## State and notification behavior
+
+- Every showing includes its Hebrew weekday in both `state.json` and Telegram.
+- The state stores all known screenings whose date has not passed yet.
+- Planet occasionally fails to render an entire date during one scan. A temporary
+  omission therefore does not delete the known screenings or cause them to be
+  announced again when they reappear on the next scan.
+- Past dates are pruned automatically.
+- An empty list of new screenings never creates a header-only Telegram message.
+
 ## Safety behavior
 
 - One public-page check every five minutes.
 - No login, seat selection, reservation, or purchasing.
 - The monitor uses a normal browser renderer because showtimes are loaded dynamically.
 - Initial discovery does not generate a false “new showtime” alert.
-- A state file is committed only when the detected result set changes.
+- A state file is committed only when the known, not-yet-past result set changes.
 
 ## Manual local checks
 
@@ -50,6 +60,7 @@ python monitor.py --notify-on-first-run
 ## Troubleshooting
 
 A failed scheduled run is visible under the repository's **Actions** tab.
-The job logs report how many relevant and new items were detected. If Planet
-changes its page structure, tests can still pass while scraping returns zero;
-the initial-baseline confirmation and run logs make that visible.
+The job logs report how many relevant, new, and retained known screenings were
+found. If Planet changes its page structure, tests can still pass while scraping
+returns zero; retained future state prevents that single incomplete run from
+causing duplicate notifications.

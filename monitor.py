@@ -6,10 +6,11 @@ import json
 import os
 import re
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -29,10 +30,21 @@ MOVIE_TERMS = [
 MOVIE_NAME = os.getenv("MOVIE_NAME", "האודיסאה")
 CINEMA_NAME = "Planet Rishon LeZion"
 FORMAT_NAME = "IMAX"
-STATE_VERSION = 4
+STATE_VERSION = 5
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json"))
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "21"))
 TELEGRAM_MAX_TEXT = 3900
+ISRAEL_TIMEZONE = ZoneInfo("Asia/Jerusalem")
+
+HEBREW_WEEKDAYS = (
+    "יום שני",
+    "יום שלישי",
+    "יום רביעי",
+    "יום חמישי",
+    "יום שישי",
+    "יום שבת",
+    "יום ראשון",
+)
 
 TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 NEXT_FORMAT_RE = re.compile(
@@ -43,6 +55,33 @@ NEXT_FORMAT_RE = re.compile(
 
 def normalize(value: str) -> str:
     return " ".join((value or "").split())
+
+
+def israel_today() -> date:
+    return datetime.now(ISRAEL_TIMEZONE).date()
+
+
+def weekday_name(value: str) -> str:
+    if not value:
+        return "יום לא זוהה"
+
+    try:
+        return HEBREW_WEEKDAYS[date.fromisoformat(value).weekday()]
+    except ValueError:
+        return "יום לא זוהה"
+
+
+def canonical_showing(item: dict[str, str]) -> dict[str, str]:
+    screening_date = item.get("date", "")
+    return {
+        "cinema": item.get("cinema", CINEMA_NAME),
+        "movie": item.get("movie", MOVIE_NAME),
+        "date": screening_date,
+        "weekday": weekday_name(screening_date),
+        "time": item.get("time", ""),
+        "format": item.get("format", FORMAT_NAME),
+        "url": item.get("url", MOVIE_PAGE_URL),
+    }
 
 
 def showing_key(item: dict[str, str]) -> str:
@@ -58,6 +97,13 @@ def showing_key(item: dict[str, str]) -> str:
 
 
 stable_key = showing_key
+
+
+def showing_sort_key(showing: dict[str, str]) -> tuple[str, str]:
+    return (
+        showing.get("date", ""),
+        showing.get("time", ""),
+    )
 
 
 def is_relevant(text: str) -> bool:
@@ -103,14 +149,16 @@ def extract_imax_showings(
     times = list(dict.fromkeys(TIME_RE.findall(imax_section)))
 
     return [
-        {
-            "cinema": CINEMA_NAME,
-            "movie": MOVIE_NAME,
-            "date": screening_date,
-            "time": time,
-            "format": FORMAT_NAME,
-            "url": booking_url,
-        }
+        canonical_showing(
+            {
+                "cinema": CINEMA_NAME,
+                "movie": MOVIE_NAME,
+                "date": screening_date,
+                "time": time,
+                "format": FORMAT_NAME,
+                "url": booking_url,
+            }
+        )
         for time in times
     ]
 
@@ -167,6 +215,7 @@ def choose_booking_link(card_links: list[str], requested_date: str, fallback: st
 
 async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
     all_showings: list[dict[str, str]] = []
+    first_day = israel_today()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -175,17 +224,17 @@ async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
             timezone_id="Asia/Jerusalem",
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "Chrome/126 Safari/537.36 PlanetShowtimeMonitor/4.0"
+                "Chrome/126 Safari/537.36 PlanetShowtimeMonitor/5.0"
             ),
         )
 
         try:
             for offset in range(days_ahead + 1):
-                day = date.today() + timedelta(days=offset)
+                day = first_day + timedelta(days=offset)
                 day_text = day.isoformat()
                 requested_url = build_booking_url(day)
 
-                print(f"Scanning {day_text}: {requested_url}")
+                print(f"Scanning {day_text} ({weekday_name(day_text)}): {requested_url}")
 
                 await page.goto(
                     requested_url,
@@ -246,17 +295,11 @@ async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
             await browser.close()
 
     deduplicated = {
-        showing_key(showing): showing
+        showing_key(showing): canonical_showing(showing)
         for showing in all_showings
     }
 
-    return sorted(
-        deduplicated.values(),
-        key=lambda showing: (
-            showing.get("date", ""),
-            showing.get("time", ""),
-        ),
-    )
+    return sorted(deduplicated.values(), key=showing_sort_key)
 
 
 def load_state(path: Path = STATE_PATH) -> dict[str, Any] | None:
@@ -274,16 +317,56 @@ def state_is_current(previous: dict[str, Any] | None) -> bool:
     return bool(previous and previous.get("state_version") == STATE_VERSION)
 
 
+def showing_is_not_past(item: dict[str, str], today: date) -> bool:
+    try:
+        return date.fromisoformat(item.get("date", "")) >= today
+    except ValueError:
+        return False
+
+
+def merge_known_showings(
+    previous: dict[str, Any] | None,
+    current: list[dict[str, str]],
+    today: date | None = None,
+) -> list[dict[str, str]]:
+    """
+    Preserve all known, not-yet-past screenings.
+
+    Planet's dynamically rendered page occasionally omits an entire date for a
+    single run. Replacing the state with that incomplete scrape makes the same
+    screenings look new when they reappear five minutes later. Keeping known
+    future screenings prevents those duplicate Telegram alerts while expired
+    dates are still removed automatically.
+    """
+    today = today or israel_today()
+    merged: dict[str, dict[str, str]] = {}
+
+    if state_is_current(previous):
+        for item in previous.get("showings", []):
+            if not isinstance(item, dict):
+                continue
+            normalized = canonical_showing(item)
+            if showing_is_not_past(normalized, today):
+                merged[showing_key(normalized)] = normalized
+
+    for item in current:
+        normalized = canonical_showing(item)
+        if showing_is_not_past(normalized, today):
+            merged[showing_key(normalized)] = normalized
+
+    return sorted(merged.values(), key=showing_sort_key)
+
+
 def save_state(
     showings: list[dict[str, str]],
     path: Path = STATE_PATH,
 ) -> None:
     payload = {
         "state_version": STATE_VERSION,
-        "showings": showings,
+        "showings": [canonical_showing(item) for item in showings],
     }
     path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -302,7 +385,7 @@ def find_new_showings(
     }
 
     return [
-        item
+        canonical_showing(item)
         for item in current
         if showing_key(item) not in old_keys
     ]
@@ -362,7 +445,8 @@ def split_telegram_message(header: str, blocks: list[str]) -> list[str]:
 
 def telegram_send_many(messages: list[str]) -> None:
     for message in messages:
-        telegram_send_one(message)
+        if message.strip():
+            telegram_send_one(message)
 
 
 def readable_date(value: str) -> str:
@@ -370,22 +454,27 @@ def readable_date(value: str) -> str:
         return "תאריך לא זוהה"
 
     try:
-        year, month, day = value.split("-")
-        return f"{day}/{month}/{year}"
+        parsed = date.fromisoformat(value)
+        return parsed.strftime("%d/%m/%Y")
     except ValueError:
         return value
 
 
 def format_showing(item: dict[str, str]) -> str:
+    screening_date = item.get("date", "")
+    weekday = item.get("weekday") or weekday_name(screening_date)
     return (
-        f"📅 {readable_date(item.get('date', ''))}\n"
-        f"🕒 {item.get('time', 'שעה לא זוהתה')}\n"
+        f"📅 {weekday}, {readable_date(screening_date)}\n"
+        f"🕒 {item.get('time') or 'שעה לא זוהתה'}\n"
         f"🎞 {item.get('format', FORMAT_NAME)}\n"
         f"🔗 {item.get('url', MOVIE_PAGE_URL)}"
     )
 
 
 def alert_messages(items: list[dict[str, str]]) -> list[str]:
+    if not items:
+        return []
+
     header = (
         "🎬 נמצאו הקרנות IMAX חדשות של האודיסאה "
         "בפלאנט ראשון לציון:"
@@ -429,22 +518,25 @@ async def run(
     previous = load_state()
     baseline_run = not state_is_current(previous)
     new_items = find_new_showings(previous, current)
+    known_showings = merge_known_showings(previous, current)
 
-    print(f"Total validated IMAX screenings found: {len(current)}")
+    print(f"Total validated IMAX screenings found this run: {len(current)}")
     for item in current:
         print(
             f"- date={item.get('date') or '?'} "
+            f"weekday={item.get('weekday') or '?'} "
             f"time={item.get('time')} "
             f"format={item.get('format')}"
         )
 
     print(f"New validated IMAX screenings found: {len(new_items)}")
+    print(f"Known not-yet-past screenings saved: {len(known_showings)}")
     print(f"Baseline/migration run: {baseline_run}")
 
-    save_state(current)
+    save_state(known_showings)
 
     if baseline_run and notify_on_first_run:
-        telegram_send_many(baseline_messages(current))
+        telegram_send_many(baseline_messages(known_showings))
     elif new_items:
         telegram_send_many(alert_messages(new_items))
 
