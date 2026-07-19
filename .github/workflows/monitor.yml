@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       send_test:
-        description: "Send Telegram sanity-check message"
+        description: "Send Telegram sanity-check message only"
         required: false
         type: boolean
         default: true
@@ -18,7 +18,12 @@ on:
         description: "Notify after creating the initial baseline"
         required: false
         type: boolean
-        default: true
+        default: false
+      force_notify:
+        description: "Send a current-screenings notification even if nothing is new"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -55,17 +60,27 @@ jobs:
 
       - name: Run monitor
         run: |
-          ARGS=""
+          ARGS=()
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.send_test }}" == "true" ]]; then
-            ARGS="$ARGS --send-test"
+            ARGS+=(--send-test)
           fi
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.notify_on_first_run }}" == "true" ]]; then
-            ARGS="$ARGS --notify-on-first-run"
+            ARGS+=(--notify-on-first-run)
           fi
-          python monitor.py $ARGS
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force_notify }}" == "true" ]]; then
+            ARGS+=(--force-notify)
+          fi
+
+          printf 'Monitor arguments:'
+          printf ' %q' "${ARGS[@]}"
+          printf '\n'
+          python monitor.py "${ARGS[@]}"
 
       - name: Commit updated monitor state
-        if: ${{ github.event_name == 'schedule' || inputs.send_test == false }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.send_test == false }}
         run: |
           if git diff --quiet -- state.json; then
             echo "No state change."

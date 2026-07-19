@@ -1,5 +1,7 @@
+import asyncio
 from datetime import date
 
+import monitor
 from monitor import (
     STATE_VERSION,
     alert_messages,
@@ -7,8 +9,12 @@ from monitor import (
     extract_date,
     extract_imax_showings,
     find_new_showings,
+    forced_notification_messages,
+    load_state,
     merge_known_showings,
+    save_state,
     split_telegram_message,
+    state_requests_force_notification,
     weekday_name,
 )
 
@@ -68,6 +74,225 @@ def test_state_version_migration_avoids_false_alert():
     }
     current = [showing("2026-07-19")]
     assert find_new_showings(previous, current) == []
+
+
+def test_missing_state_file_keeps_first_run_alert_protection(tmp_path):
+    previous = load_state(tmp_path / "missing-state.json")
+    current = [showing("2026-07-19")]
+
+    assert previous is None
+    assert find_new_showings(previous, current) == []
+
+
+def test_blank_state_file_is_an_explicit_alert_reset(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("", encoding="utf-8")
+
+    previous = load_state(state_path)
+    current = [showing("2026-07-19")]
+    new_items = find_new_showings(previous, current)
+
+    assert previous == {
+        "state_version": STATE_VERSION,
+        "showings": [],
+        "force_notify": True,
+    }
+    assert state_requests_force_notification(previous)
+    assert len(new_items) == 1
+    assert new_items[0]["date"] == "2026-07-19"
+    assert new_items[0]["weekday"] == "יום ראשון"
+
+
+def test_whitespace_only_state_file_is_an_explicit_alert_reset(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("  \n\t", encoding="utf-8")
+
+    previous = load_state(state_path)
+
+    assert previous == {
+        "state_version": STATE_VERSION,
+        "showings": [],
+        "force_notify": True,
+    }
+    assert state_requests_force_notification(previous)
+
+
+def test_malformed_nonempty_state_fails_loudly(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{not valid json}", encoding="utf-8")
+
+    try:
+        load_state(state_path)
+    except RuntimeError as exc:
+        assert "invalid JSON" in str(exc)
+        assert "force_notify" in str(exc)
+    else:
+        raise AssertionError("Malformed non-empty state must raise RuntimeError")
+
+
+def test_blank_state_reaches_telegram_alert_path(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("", encoding="utf-8")
+    current = [showing("2026-07-19")]
+    sent_messages: list[str] = []
+    saved_showings: list[dict[str, str]] = []
+
+    async def fake_scrape_showings():
+        return current
+
+    monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
+    monkeypatch.setattr(monitor, "load_state", lambda: load_state(state_path))
+    monkeypatch.setattr(
+        monitor,
+        "save_state",
+        lambda showings: saved_showings.extend(showings),
+    )
+    monkeypatch.setattr(
+        monitor,
+        "telegram_send_many",
+        lambda messages: sent_messages.extend(messages),
+    )
+
+    result = asyncio.run(
+        monitor.run(send_test=False, notify_on_first_run=False)
+    )
+
+    assert result == 0
+    assert len(saved_showings) == 1
+    assert len(sent_messages) == 1
+    assert "בדיקת התראה מאולצת" in sent_messages[0]
+    assert "יום ראשון, 19/07/2026" in sent_messages[0]
+
+
+def test_explicit_json_force_notify_state_is_detected(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        '{"state_version": %d, "showings": [], "force_notify": true}'
+        % STATE_VERSION,
+        encoding="utf-8",
+    )
+
+    previous = load_state(state_path)
+
+    assert state_requests_force_notification(previous)
+
+
+def test_force_notify_sends_snapshot_even_when_showing_is_already_known(monkeypatch):
+    current = [showing("2026-07-19")]
+    previous = {
+        "state_version": STATE_VERSION,
+        "showings": current,
+        "force_notify": True,
+    }
+    sent_messages: list[str] = []
+    saved_showings: list[dict[str, str]] = []
+
+    async def fake_scrape_showings():
+        return current
+
+    monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
+    monkeypatch.setattr(monitor, "load_state", lambda: previous)
+    monkeypatch.setattr(
+        monitor,
+        "save_state",
+        lambda showings: saved_showings.extend(showings),
+    )
+    monkeypatch.setattr(
+        monitor,
+        "telegram_send_many",
+        lambda messages: sent_messages.extend(messages),
+    )
+
+    result = asyncio.run(
+        monitor.run(
+            send_test=False,
+            notify_on_first_run=False,
+            force_notify=False,
+        )
+    )
+
+    assert result == 0
+    assert len(sent_messages) == 1
+    assert "בדיקת התראה מאולצת" in sent_messages[0]
+    assert "יום ראשון, 19/07/2026" in sent_messages[0]
+    assert len(saved_showings) == 1
+
+
+def test_force_notify_sends_diagnostic_even_when_scrape_is_empty(monkeypatch):
+    previous = {
+        "state_version": STATE_VERSION,
+        "showings": [],
+        "force_notify": True,
+    }
+    sent_messages: list[str] = []
+
+    async def fake_scrape_showings():
+        return []
+
+    monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
+    monkeypatch.setattr(monitor, "load_state", lambda: previous)
+    monkeypatch.setattr(monitor, "save_state", lambda showings: None)
+    monkeypatch.setattr(
+        monitor,
+        "telegram_send_many",
+        lambda messages: sent_messages.extend(messages),
+    )
+
+    result = asyncio.run(
+        monitor.run(
+            send_test=False,
+            notify_on_first_run=False,
+            force_notify=False,
+        )
+    )
+
+    assert result == 0
+    assert sent_messages == forced_notification_messages([])
+    assert "לא זוהו הקרנות" in sent_messages[0]
+
+
+def test_cli_force_notify_overrides_normal_state(monkeypatch):
+    current = [showing("2026-07-19")]
+    previous = {
+        "state_version": STATE_VERSION,
+        "showings": current,
+    }
+    sent_messages: list[str] = []
+
+    async def fake_scrape_showings():
+        return current
+
+    monkeypatch.setattr(monitor, "scrape_showings", fake_scrape_showings)
+    monkeypatch.setattr(monitor, "load_state", lambda: previous)
+    monkeypatch.setattr(monitor, "save_state", lambda showings: None)
+    monkeypatch.setattr(
+        monitor,
+        "telegram_send_many",
+        lambda messages: sent_messages.extend(messages),
+    )
+
+    result = asyncio.run(
+        monitor.run(
+            send_test=False,
+            notify_on_first_run=False,
+            force_notify=True,
+        )
+    )
+
+    assert result == 0
+    assert len(sent_messages) == 1
+    assert "בדיקת התראה מאולצת" in sent_messages[0]
+
+
+def test_save_state_consumes_force_notify_flag(tmp_path):
+    state_path = tmp_path / "state.json"
+    save_state([showing("2026-07-19")], state_path)
+
+    saved = load_state(state_path)
+
+    assert saved is not None
+    assert "force_notify" not in saved
+    assert len(saved["showings"]) == 1
 
 
 def test_current_state_detects_new_showing():
