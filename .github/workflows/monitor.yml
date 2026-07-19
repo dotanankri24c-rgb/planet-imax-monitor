@@ -1,6 +1,9 @@
 name: Planet IMAX monitor
 
 on:
+  push:
+    branches:
+      - master
   schedule:
     # Check every 5 minutes, including exact hour boundaries
     - cron: "*/5 * * * *"
