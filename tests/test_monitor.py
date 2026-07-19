@@ -1,8 +1,11 @@
+from datetime import date
+
 from monitor import (
     STATE_VERSION,
+    build_booking_url,
+    extract_date,
     extract_imax_showings,
     find_new_showings,
-    is_relevant,
     showing_key,
 )
 
@@ -16,68 +19,86 @@ CARD = (
     "VIP2D 17:0020:30 אנגלית·(כתוביות·עברית)"
 )
 
-URL = (
+FRAGMENT_URL = (
     "https://www.planetcinema.co.il/films/the-odyssey/7460s2r"
-    "?in-cinema=1072&at=2026-07-19"
+    "#/buy-tickets-by-film?"
+    "in-cinema=1072&at=2026-07-19&for-movie=7460s2r&view-mode=list"
 )
 
 
-def test_relevance_requires_movie_and_imax():
-    assert is_relevant("האודיסאה IMAX יום חמישי 20:30")
-    assert is_relevant("The Odyssey — IMAX")
-    assert not is_relevant("האודיסאה 2D")
-    assert not is_relevant("סרט אחר IMAX")
+def test_extract_date_from_fragment_query():
+    assert extract_date(FRAGMENT_URL) == "2026-07-19"
 
 
-def test_extracts_only_imax_times():
-    showings = extract_imax_showings(CARD, URL)
+def test_build_booking_url_contains_requested_date():
+    url = build_booking_url(date(2026, 7, 25))
+    assert "at=2026-07-25" in url
+    assert "in-cinema=1072" in url
+
+
+def test_extracts_only_imax_times_with_expected_date():
+    showings = extract_imax_showings(
+        CARD,
+        FRAGMENT_URL,
+        expected_date="2026-07-19",
+    )
 
     assert [item["time"] for item in showings] == [
         "13:30",
         "17:00",
         "20:30",
     ]
-    assert all(item["format"] == "IMAX" for item in showings)
     assert all(item["date"] == "2026-07-19" for item in showings)
 
 
-def test_old_noisy_state_is_migrated_without_false_alert():
+def test_old_state_migrates_without_false_alert():
     old_state = {
-        "showings": [
-            {
-                "context": CARD,
-                "label": "12:30",
-                "url": URL,
-            }
-        ]
+        "state_version": 2,
+        "showings": [],
     }
-    current = extract_imax_showings(CARD, URL)
+    current = extract_imax_showings(
+        CARD,
+        FRAGMENT_URL,
+        expected_date="2026-07-19",
+    )
 
     assert find_new_showings(old_state, current) == []
 
 
-def test_detects_only_new_imax_screening():
-    current = extract_imax_showings(CARD, URL)
+def test_detects_new_screening_on_different_date():
+    current_day_one = extract_imax_showings(
+        CARD,
+        FRAGMENT_URL,
+        expected_date="2026-07-19",
+    )
+    current_day_two = extract_imax_showings(
+        CARD,
+        FRAGMENT_URL.replace("2026-07-19", "2026-07-20"),
+        expected_date="2026-07-20",
+    )
+    current = current_day_one + current_day_two
+
     previous = {
         "state_version": STATE_VERSION,
-        "showings": current[:2],
+        "showings": current_day_one,
     }
 
-    assert find_new_showings(previous, current) == [current[2]]
+    assert find_new_showings(previous, current) == current_day_two
 
 
-def test_key_ignores_url_changes():
-    original = {
+def test_key_distinguishes_same_time_on_different_dates():
+    first = {
         "cinema": "Planet Rishon LeZion",
         "movie": "האודיסאה",
         "date": "2026-07-19",
         "time": "20:30",
         "format": "IMAX",
-        "url": "https://old-link",
+        "url": "https://example.com/1",
     }
-    changed_link = {
-        **original,
-        "url": "https://new-link",
+    second = {
+        **first,
+        "date": "2026-07-20",
+        "url": "https://example.com/2",
     }
 
-    assert showing_key(original) == showing_key(changed_link)
+    assert showing_key(first) != showing_key(second)

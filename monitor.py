@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -18,6 +19,12 @@ CINEMA_URL = os.getenv(
     "PLANET_CINEMA_URL",
     "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon/1072",
 )
+MOVIE_PAGE_URL = os.getenv(
+    "PLANET_MOVIE_URL",
+    "https://www.planetcinema.co.il/films/the-odyssey/7460s2r",
+)
+MOVIE_ID = os.getenv("PLANET_MOVIE_ID", "7460s2r")
+CINEMA_ID = os.getenv("PLANET_CINEMA_ID", "1072")
 MOVIE_TERMS = [
     value.strip().casefold()
     for value in os.getenv("MOVIE_TERMS", "האודיסאה,the odyssey").split(",")
@@ -26,9 +33,10 @@ MOVIE_TERMS = [
 MOVIE_NAME = os.getenv("MOVIE_NAME", "האודיסאה")
 CINEMA_NAME = "Planet Rishon LeZion"
 FORMAT_NAME = "IMAX"
-STATE_VERSION = 2
+STATE_VERSION = 3
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json"))
 BASE_URL = "https://www.planetcinema.co.il"
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "21"))
 
 TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 NEXT_FORMAT_RE = re.compile(
@@ -42,7 +50,6 @@ def normalize(value: str) -> str:
 
 
 def showing_key(item: dict[str, str]) -> str:
-    """Create a stable identity for a single screening."""
     identity = {
         "cinema": item.get("cinema", ""),
         "movie": item.get("movie", ""),
@@ -54,7 +61,6 @@ def showing_key(item: dict[str, str]) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-# Backward-compatible alias for the original tests/imports.
 stable_key = showing_key
 
 
@@ -64,21 +70,38 @@ def is_relevant(text: str) -> bool:
 
 
 def extract_date(url: str) -> str:
-    values = parse_qs(urlparse(url).query).get("at", [])
-    return values[0] if values else ""
+    """
+    Planet stores booking parameters inside the URL fragment, for example:
+    ...#/buy-tickets-by-film?in-cinema=1072&at=2026-07-19
+    """
+    parsed = urlparse(url)
+
+    query_values = parse_qs(parsed.query).get("at", [])
+    if query_values:
+        return query_values[0]
+
+    fragment_query = parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else ""
+    fragment_values = parse_qs(fragment_query).get("at", [])
+    return fragment_values[0] if fragment_values else ""
+
+
+def build_booking_url(day: date) -> str:
+    day_text = day.isoformat()
+    return (
+        f"{MOVIE_PAGE_URL}"
+        f"#/buy-tickets-by-film?"
+        f"in-cinema={CINEMA_ID}&"
+        f"at={day_text}&"
+        f"for-movie={MOVIE_ID}&"
+        f"view-mode=list"
+    )
 
 
 def extract_imax_showings(
     context: str,
     booking_url: str,
+    expected_date: str = "",
 ) -> list[dict[str, str]]:
-    """
-    Extract only IMAX screenings from a Planet movie card.
-
-    Planet places several format sections in one text block. This function
-    isolates the text after IMAX and before the next format heading, then
-    extracts only the times in that section.
-    """
     compact = normalize(context)
     match = re.search(r"IMAX\s*(?:2D|3D)?\s*(.*)", compact, flags=re.IGNORECASE)
     if not match:
@@ -86,22 +109,48 @@ def extract_imax_showings(
 
     imax_section = NEXT_FORMAT_RE.split(match.group(1), maxsplit=1)[0]
     times = list(dict.fromkeys(TIME_RE.findall(imax_section)))
-    date = extract_date(booking_url)
+    screening_date = expected_date or extract_date(booking_url)
 
     return [
         {
             "cinema": CINEMA_NAME,
             "movie": MOVIE_NAME,
-            "date": date,
+            "date": screening_date,
             "time": time,
             "format": FORMAT_NAME,
-            "url": booking_url or CINEMA_URL,
+            "url": booking_url,
         }
         for time in times
     ]
 
 
-async def scrape_showings(url: str = CINEMA_URL) -> list[dict[str, str]]:
+async def extract_movie_card(page) -> str:
+    return await page.evaluate(
+        """(movieTerms) => {
+          const terms = movieTerms.map(value => value.toLocaleLowerCase());
+          let best = '';
+
+          for (const element of document.querySelectorAll('body *')) {
+            const text = (element.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (!text || text.length > 1800 || !text.includes('IMAX')) continue;
+
+            const lower = text.toLocaleLowerCase();
+            if (!terms.some(term => lower.includes(term))) continue;
+
+            if (!best || text.length < best.length) {
+              best = text;
+            }
+          }
+
+          return best;
+        }""",
+        MOVIE_TERMS,
+    )
+
+
+async def scrape_showings(days_ahead: int = DAYS_AHEAD) -> list[dict[str, str]]:
+    all_showings: list[dict[str, str]] = []
+
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page = await browser.new_page(
@@ -109,90 +158,52 @@ async def scrape_showings(url: str = CINEMA_URL) -> list[dict[str, str]]:
             timezone_id="Asia/Jerusalem",
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "Chrome/126 Safari/537.36 PlanetShowtimeMonitor/2.0"
+                "Chrome/126 Safari/537.36 PlanetShowtimeMonitor/3.0"
             ),
         )
 
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=25_000)
-            except PlaywrightTimeoutError:
-                pass
-            await page.wait_for_timeout(4_000)
+            for offset in range(days_ahead + 1):
+                day = date.today() + timedelta(days=offset)
+                day_text = day.isoformat()
+                booking_url = build_booking_url(day)
 
-            cards: list[dict[str, str]] = await page.evaluate(
-                """(movieTerms) => {
-                  const terms = movieTerms.map(value => value.toLocaleLowerCase());
-                  const result = [];
-                  const seen = new Set();
+                print(f"Scanning {day_text}: {booking_url}")
 
-                  for (const anchor of document.querySelectorAll('a[href]')) {
-                    const href = anchor.href || '';
-                    const ownText = (anchor.innerText || '')
-                      .replace(/\\s+/g, ' ')
-                      .trim();
+                await page.goto(
+                    booking_url,
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
 
-                    const looksLikeMovieLink =
-                      href.includes('/films/the-odyssey/') ||
-                      terms.some(term =>
-                        ownText.toLocaleLowerCase().includes(term)
-                      );
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=20_000)
+                except PlaywrightTimeoutError:
+                    pass
 
-                    if (!looksLikeMovieLink) continue;
+                await page.wait_for_timeout(2_500)
 
-                    let node = anchor;
-                    let cardText = '';
+                card_text = normalize(await extract_movie_card(page))
+                if not card_text or not is_relevant(card_text):
+                    print(f"  No IMAX card found for {day_text}")
+                    continue
 
-                    for (
-                      let depth = 0;
-                      depth < 8 && node;
-                      depth++, node = node.parentElement
-                    ) {
-                      const text = (node.innerText || '')
-                        .replace(/\\s+/g, ' ')
-                        .trim();
-                      const lower = text.toLocaleLowerCase();
-
-                      if (
-                        text.length < 1800 &&
-                        text.includes('IMAX') &&
-                        terms.some(term => lower.includes(term))
-                      ) {
-                        cardText = text;
-                        break;
-                      }
-                    }
-
-                    if (!cardText) continue;
-
-                    const key = cardText + '\\n' + href;
-                    if (!seen.has(key)) {
-                      seen.add(key);
-                      result.push({context: cardText, url: href});
-                    }
-                  }
-
-                  return result;
-                }""",
-                MOVIE_TERMS,
-            )
+                day_showings = extract_imax_showings(
+                    card_text,
+                    booking_url,
+                    expected_date=day_text,
+                )
+                print(
+                    f"  Found {len(day_showings)} IMAX screening(s): "
+                    + ", ".join(item["time"] for item in day_showings)
+                )
+                all_showings.extend(day_showings)
         finally:
             await browser.close()
 
-    showings: list[dict[str, str]] = []
-
-    for card in cards:
-        context = normalize(card.get("context", ""))
-        if not is_relevant(context):
-            continue
-
-        booking_url = urljoin(BASE_URL, card.get("url", ""))
-        showings.extend(extract_imax_showings(context, booking_url))
-
     deduplicated = {
         showing_key(showing): showing
-        for showing in showings
+        for showing in all_showings
     }
 
     return sorted(
@@ -237,8 +248,6 @@ def find_new_showings(
     previous: dict[str, Any] | None,
     current: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    # Treat the old noisy schema as a migration baseline, so upgrading does not
-    # cause false "new screening" notifications.
     if not state_is_current(previous):
         return []
 
@@ -339,7 +348,7 @@ async def run(
     baseline_run = not state_is_current(previous)
     new_items = find_new_showings(previous, current)
 
-    print(f"IMAX screenings found: {len(current)}")
+    print(f"Total IMAX screenings found: {len(current)}")
     for item in current:
         print(
             f"- date={item.get('date') or '?'} "
