@@ -24,6 +24,7 @@ URL_19 = (
     "in-cinema=1072&at=2026-07-19&for-movie=7460s2r"
 )
 URL_20 = URL_19.replace("2026-07-19", "2026-07-20")
+RUN_TEST_TODAY = date(2026, 7, 19)
 
 
 def showing(screening_date: str, screening_time: str = "20:30") -> dict[str, str]:
@@ -42,6 +43,10 @@ def valid_state(*items: dict[str, str]) -> dict:
         "state_version": STATE_VERSION,
         "showings": list(items),
     }
+
+
+def freeze_monitor_today(monkeypatch) -> None:
+    monkeypatch.setattr(monitor, "israel_today", lambda: RUN_TEST_TODAY)
 
 
 def test_extract_date_from_fragment():
@@ -148,6 +153,7 @@ def test_current_state_detects_only_missing_showing():
 
 
 def test_run_sends_normal_alert_for_genuinely_new_showing(monkeypatch):
+    freeze_monitor_today(monkeypatch)
     known = showing("2026-07-19")
     new = showing("2026-07-20", "10:00")
     previous = valid_state(known)
@@ -181,6 +187,7 @@ def test_run_sends_normal_alert_for_genuinely_new_showing(monkeypatch):
 
 
 def test_run_does_not_notify_when_nothing_is_new(monkeypatch):
+    freeze_monitor_today(monkeypatch)
     known = showing("2026-07-19")
     previous = valid_state(known)
     sent_messages: list[str] = []
@@ -202,6 +209,7 @@ def test_run_does_not_notify_when_nothing_is_new(monkeypatch):
 
 
 def test_state_is_not_advanced_when_telegram_fails(monkeypatch):
+    freeze_monitor_today(monkeypatch)
     known = showing("2026-07-19")
     new = showing("2026-07-20", "10:00")
     previous = valid_state(known)

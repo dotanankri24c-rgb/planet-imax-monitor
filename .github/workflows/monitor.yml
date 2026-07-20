@@ -4,16 +4,13 @@ on:
   push:
     branches:
       - master
-  # schedule:
-  #   # Check every 5 minutes, including exact hour boundaries
-  #   - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       send_test:
         description: "Send Telegram sanity-check message only"
         required: false
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -39,14 +36,18 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install --with-deps chromium
 
       - name: Run unit tests
+        if: ${{ github.event_name == 'push' }}
         run: PYTHONPATH="${GITHUB_WORKSPACE}" python -m pytest -q
+
+      - name: Install Chromium for monitor
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.send_test == false }}
+        run: playwright install --with-deps chromium
 
       - name: Run monitor
         run: |
