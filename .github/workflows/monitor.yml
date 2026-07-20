@@ -4,9 +4,9 @@ on:
   push:
     branches:
       - master
-  schedule:
-    # Check every 5 minutes, including exact hour boundaries
-    - cron: "*/5 * * * *"
+  # schedule:
+  #   # Check every 5 minutes, including exact hour boundaries
+  #   - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       send_test:
