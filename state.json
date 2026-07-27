@@ -285,6 +285,15 @@
       "movie": "האודיסאה",
       "date": "2026-07-30",
       "weekday": "יום חמישי",
+      "time": "12:40",
+      "format": "IMAX",
+      "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
+    },
+    {
+      "cinema": "Planet Rishon LeZion",
+      "movie": "האודיסאה",
+      "date": "2026-07-30",
+      "weekday": "יום חמישי",
       "time": "13:15",
       "format": "IMAX",
       "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
@@ -321,6 +330,15 @@
       "movie": "האודיסאה",
       "date": "2026-07-30",
       "weekday": "יום חמישי",
+      "time": "16:00",
+      "format": "IMAX",
+      "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
+    },
+    {
+      "cinema": "Planet Rishon LeZion",
+      "movie": "האודיסאה",
+      "date": "2026-07-30",
+      "weekday": "יום חמישי",
       "time": "17:00",
       "format": "IMAX",
       "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
@@ -348,6 +366,15 @@
       "movie": "האודיסאה",
       "date": "2026-07-30",
       "weekday": "יום חמישי",
+      "time": "19:30",
+      "format": "IMAX",
+      "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
+    },
+    {
+      "cinema": "Planet Rishon LeZion",
+      "movie": "האודיסאה",
+      "date": "2026-07-30",
+      "weekday": "יום חמישי",
       "time": "20:30",
       "format": "IMAX",
       "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
@@ -367,6 +394,15 @@
       "date": "2026-07-30",
       "weekday": "יום חמישי",
       "time": "21:30",
+      "format": "IMAX",
+      "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
+    },
+    {
+      "cinema": "Planet Rishon LeZion",
+      "movie": "האודיסאה",
+      "date": "2026-07-30",
+      "weekday": "יום חמישי",
+      "time": "23:00",
       "format": "IMAX",
       "url": "https://www.planetcinema.co.il/cinemas/Rishon_Letziyon#/buy-tickets-by-cinema?in-cinema=1072&at=2026-07-30&for-movie=7460s2r&view-mode=list"
     },
